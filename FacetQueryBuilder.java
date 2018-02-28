@@ -268,8 +268,9 @@ public class FacetQueryBuilder {
 				}
 				if(sortType == null) {
 					for(;fit.hasNext()&&list.size()<limit;){
-						if(fit.count() > minCount){
-							list.add(new Tuple(fit.next(), fit.count()));
+						int count = fit.count();
+						if(count > minCount){
+							list.add(new Tuple(fit.next(), count));
 						}
 					}
 				} else {
@@ -277,8 +278,9 @@ public class FacetQueryBuilder {
 					int in = 0;
 					Tuple top = null;
 					for(;fit.hasNext();){
-						if(fit.count() > minCount){
-							Tuple a = new Tuple(fit.next(), fit.count());
+						int count = fit.count();
+						if(count > minCount){
+							Tuple a = new Tuple(fit.next(), count);
 							if(in == limit){
 								if(sortType.isInQueue(top, a)){
 									top.a = a.a;
@@ -340,6 +342,7 @@ public class FacetQueryBuilder {
 		protected TermsEnum te;
 		protected BytesRef term;
 		private BitSet liveDocs;
+		private int count;
 		
 		TermsEnumFacetIterator(TermsEnum te, BitSet liveDocs){
 			this.te = te;
@@ -348,35 +351,35 @@ public class FacetQueryBuilder {
 		
 		@Override
 		public int count() {
-			try {
-				if(liveDocs == null){
-					return te.docFreq();
-				} else {
-					BitSetIterator it = new BitSetIterator(this.liveDocs, 0);
-					PostingsEnum pe = te.postings(null);
-					int doc = it.nextDoc();
-					int count = 0;
-					while(doc != BitSetIterator.NO_MORE_DOCS){
-						int _doc = pe.advance(doc);
-						if(_doc == doc){
-							count ++;
-						}
+			return count;
+		}
+		protected void count0() throws IOException{
+			if(liveDocs == null){
+				this.count = te.docFreq();
+			} else {
+				BitSetIterator it = new BitSetIterator(this.liveDocs, 0);
+				PostingsEnum pe = te.postings(null);
+				int doc = it.nextDoc();
+				int count = 0;
+				while(doc != BitSetIterator.NO_MORE_DOCS){
+					int _doc = pe.advance(doc);
+					if(_doc == doc){
+						count ++;
 					}
-					return count;
 				}
-			} catch (IOException e) {
-				e.printStackTrace();
+				this.count = count;
 			}
-			return 0;
 		}
 		@Override
 		public boolean hasNext() {
 			try {
 				this.term = te.next();
+				this.count0();
+				return this.term != null;
 			} catch (IOException e) {
 				e.printStackTrace();
 			}
-			return term != null;
+			return false;
 		}
 		@Override
 		public String next() {
@@ -392,19 +395,33 @@ public class FacetQueryBuilder {
 			this.prefix = new BytesRef(prefix);
 			try {
 				this.valid = te.seekCeil(this.prefix) != SeekStatus.END;
+				System.out.println(te.term().utf8ToString());
 			} catch (IOException e) {
 				e.printStackTrace();
 			}
 		}
 		@Override
 		public boolean hasNext() {
-			if(!valid) return false;
-			try {
-				this.term = te.next();
-			} catch (IOException e) {
-				e.printStackTrace();
+			if(valid){
+				try {
+					this.term = BytesRef.deepCopyOf(te.term());
+					super.count0();
+					return this.term != null &&  StringHelper.startsWith(this.term, this.prefix);
+				} catch (IOException e) {
+					e.printStackTrace();
+				} finally {
+					try {
+						this.term = te.next();
+					} catch (IOException e) {
+						e.printStackTrace();
+					}
+				}
 			}
-			return term != null && StringHelper.startsWith(term, prefix);
+			return false;
+		}
+		@Override
+		public String next(){
+			return this.term.utf8ToString();
 		}
 	}
 	
