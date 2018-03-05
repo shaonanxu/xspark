@@ -10,15 +10,15 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.log4j.Logger;
-import org.apache.lucene.index.BinaryDocValues;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.FieldType.NumericType;
 import org.apache.lucene.index.DocValuesType;
-import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.PostingsEnum;
 import org.apache.lucene.index.SortedDocValues;
-import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.index.TermsEnum.SeekStatus;
 import org.apache.lucene.search.Collector;
@@ -41,6 +41,7 @@ public class FacetQueryBuilder {
 	public static final Logger LOG = Logger.getLogger(FacetQueryBuilder.class);
 	
 	public static final int LIMIT = 10240;
+	public static final int TERMS_LENGTH = 10240;
 	
 	public static enum SortType{
 		DESC (DescPriorityQueue.class) {
@@ -110,13 +111,18 @@ public class FacetQueryBuilder {
 	
 	private LeafReader reader;
 	private String[] fields;
-	private FieldInfo[] fieldInfos;
+	private FieldType[] fieldTypes;
 	private BitSet baseDocs;
 	private String prefix;
-	private int minCount;
+	private int minCount; // = -1;
 	private SortType sortType;
-	private String[] facetQueries;
+	private String[] facetQueriesKey;
+	private Query[] facetQueries;
 	private int limit;
+	
+	public FacetQueryBuilder(LeafReader reader){
+		this(reader, null);
+	}
 	
 	public FacetQueryBuilder(LeafReader reader, BitSet baseDocs){
 		this.reader = reader;
@@ -149,7 +155,8 @@ public class FacetQueryBuilder {
 		this.limit = limit;
 	}
 	
-	public void setFacetQueries(String[] facetQueries){
+	public void setFacetQueries(String[] facetQueriesKey, Query[] facetQueries){
+		this.facetQueriesKey = facetQueriesKey;
 		this.facetQueries = facetQueries;
 	}
 	
@@ -157,9 +164,9 @@ public class FacetQueryBuilder {
 		this.sortType = sortType;
 	}
 	
-	public void setFacetFields(String[] fields, FieldInfo[] fieldInfos){
+	public void setFacetFields(String[] fields, FieldType[] fieldTypes){
 		this.fields = fields;
-		this.fieldInfos = fieldInfos;
+		this.fieldTypes = fieldTypes;
 	}
 	
 	public FacetSearcher<?> build(){
@@ -175,32 +182,21 @@ public class FacetQueryBuilder {
 	
 	private class QueryFacetSearcher implements FacetSearcher<List<Tuple>> {
 		
-		private static final String KEY = "!{key";
-		private static final int LIMIT = 5;
-		
 		@Override
 		public List<Tuple> search() {
 			final BitSet baseDocs = FacetQueryBuilder.this.baseDocs;
 			final int minCount = FacetQueryBuilder.this.minCount;
 			final SortType sortType = FacetQueryBuilder.this.sortType;
-			final String[] facetQueries = FacetQueryBuilder.this.facetQueries;
 			final LeafReader leafReader = FacetQueryBuilder.this.reader;
 			try {
 				List<Tuple> ret = new ArrayList<>();
+				String key = null;
 				Query luceneQuery = null;
-				for(int i=0;i<LIMIT;i++){
-					String facetQuery = facetQueries[i];
-					String key = null;
-					int p = 0;
-					if(facetQuery.startsWith(KEY)){
-						p = facetQuery.indexOf("}", 6);
-						key = facetQuery.substring(6, p);
-						luceneQuery = this.parseLuceneQuery(facetQuery.substring(p+1));
-					} else {
-						key = facetQuery.substring(p+1);
-						luceneQuery = this.parseLuceneQuery(key);
-					}
-					IndexSearcher searcher = new IndexSearcher(leafReader);
+				int len = Math.min(FacetQueryBuilder.this.facetQueriesKey.length, FacetQueryBuilder.this.facetQueries.length);
+				IndexSearcher searcher = new IndexSearcher(leafReader);
+				for(int i=0;i<len;i++){
+					key = FacetQueryBuilder.this.facetQueriesKey[i];
+					luceneQuery = FacetQueryBuilder.this.facetQueries[i];
 					FacetCollector collector = new FacetCollector(baseDocs, leafReader.maxDoc());
 					searcher.search(luceneQuery, collector);
 					int count = collector.count();
@@ -221,11 +217,6 @@ public class FacetQueryBuilder {
 				e.printStackTrace();
 			}
 			return null;
-		}
-		
-		private Query parseLuceneQuery(String query) throws IOException{
-			Query q = null;
-			return q;
 		}
 		
 		class FacetCollector implements Collector{
@@ -295,12 +286,12 @@ public class FacetQueryBuilder {
 			final SortType sortType = FacetQueryBuilder.this.sortType;
 			final int limit = FacetQueryBuilder.this.limit == 0 ? LIMIT : FacetQueryBuilder.this.limit;
 			Map<String, List<Tuple>> ret = new HashMap<>();
-			int len = Math.min(FacetQueryBuilder.this.fields.length, FacetQueryBuilder.this.fieldInfos.length);
+			int len = Math.min(FacetQueryBuilder.this.fields.length, FacetQueryBuilder.this.fieldTypes.length);
 			for(int i=0;i<len;i++){
 				String field = FacetQueryBuilder.this.fields[i];
 				List<Tuple> list = new ArrayList<>();
 				FacetIterator fit = 
-						FacetQueryBuilder.this.newFacetIterator(FacetQueryBuilder.this.reader, baseDocs, field, FacetQueryBuilder.this.fieldInfos[i], FacetQueryBuilder.this.prefix);
+						FacetQueryBuilder.this.newFacetIterator(FacetQueryBuilder.this.reader, baseDocs, field, FacetQueryBuilder.this.fieldTypes[i], FacetQueryBuilder.this.prefix);
 				if(fit == null){
 					LOG.warn(" *** Error Facet Field *** ");
 					continue;
@@ -344,32 +335,37 @@ public class FacetQueryBuilder {
 		}
 	}
 	
-	private FacetIterator newFacetIterator(LeafReader reader, BitSet liveDocs, String field, FieldInfo fieldInfo, String prefix){
-		IndexOptions indexOptions = fieldInfo.getIndexOptions();
+	/**
+	 * 生成聚合方式
+	 */
+	private FacetIterator newFacetIterator(LeafReader reader, BitSet liveDocs, String field, FieldType fieldType, String prefix){
+		IndexOptions indexOptions = fieldType.indexOptions();
 		if(indexOptions == IndexOptions.DOCS) {
 			try {
-				TermsEnum te = reader.terms(field).iterator();
-				if(prefix == null)
-					return new TermsEnumFacetIterator(te, liveDocs);
-				else 
-					return new PrefixTermsEnumFacetIterator(te, liveDocs, prefix);
+				Terms term = reader.terms(field);
+				if(term.size() < TERMS_LENGTH){
+					TermsEnum te = term.iterator();
+					if(prefix == null)
+						return new TermsEnumFacetIterator(te, liveDocs);
+					else 
+						return new PrefixTermsEnumFacetIterator(te, liveDocs, prefix);
+				}
 			} catch (IOException e) {
 				LOG.error(" *** LeafReader("+reader.getContext().toString()+") read TermsEnum error *** ", e);
 			}
-		} else {
-			if(prefix == null) {
-				DocValuesType dvt = fieldInfo.getDocValuesType();
-				try {
-					if(dvt == DocValuesType.BINARY){
-					} else if(dvt == DocValuesType.NUMERIC){
-					} else if(dvt == DocValuesType.SORTED){
-					} else if(dvt == DocValuesType.SORTED_SET){
-						return new SortedDocValuesFacetIterator(reader.getSortedSetDocValues(field), liveDocs, reader.maxDoc());
-					} else if(dvt == DocValuesType.SORTED_NUMERIC){
-					}
-				} catch (IOException e) {
-					LOG.error(" *** LeafReader("+reader.getContext().toString()+") read DocValues error *** ", e);
+		}
+		DocValuesType dvt = fieldType.docValuesType();
+		if(dvt != DocValuesType.NONE && prefix == null){
+			try {
+				if(dvt == DocValuesType.BINARY){
+				} else if(dvt == DocValuesType.NUMERIC){
+				} else if(dvt == DocValuesType.SORTED){
+					return new SortedDocValuesFacetIterator(reader.getSortedDocValues(field), liveDocs, reader.maxDoc());
+				} else if(dvt == DocValuesType.SORTED_SET){
+				} else if(dvt == DocValuesType.SORTED_NUMERIC){
 				}
+			} catch (IOException e) {
+				LOG.error(" *** LeafReader("+reader.getContext().toString()+") read DocValues error *** ", e);
 			}
 		}
 		return null;
@@ -399,9 +395,8 @@ public class FacetQueryBuilder {
 			} else {
 				BitSetIterator it = new BitSetIterator(this.liveDocs, 0);
 				PostingsEnum pe = te.postings(null);
-				int doc = it.nextDoc();
-				int count = 0;
-				while(doc != BitSetIterator.NO_MORE_DOCS){
+				int doc = 0, count = 0;
+				while((doc=it.nextDoc()) != BitSetIterator.NO_MORE_DOCS){
 					int _doc = pe.advance(doc);
 					if(_doc == doc){
 						count ++;
@@ -442,18 +437,17 @@ public class FacetQueryBuilder {
 		@Override
 		public boolean hasNext() {
 			if(valid){
+				BytesRef term = null;
 				try {
-					this.term = BytesRef.deepCopyOf(te.term());
-					super.count0();
-					return this.term != null &&  StringHelper.startsWith(this.term, this.prefix);
+					term = te.term();
+					if(term != null){
+						this.term = BytesRef.deepCopyOf(term);
+						super.count0();
+						te.next();
+						return StringHelper.startsWith(this.term, this.prefix);
+					}
 				} catch (IOException e) {
 					e.printStackTrace();
-				} finally {
-					try {
-						this.term = te.next();
-					} catch (IOException e) {
-						e.printStackTrace();
-					}
 				}
 			}
 			return false;
@@ -461,14 +455,15 @@ public class FacetQueryBuilder {
 	}
 	
 	private class SortedDocValuesFacetIterator implements FacetIterator {
-		SortedSetDocValues docValues;
+		SortedDocValues docValues;
 		BitSet liveDocs;
 		int[] termsCount;
 		int pos = -1;
 		boolean unload = true;
 		int maxDoc;
-		SortedDocValuesFacetIterator(SortedSetDocValues docValues, BitSet liveDocs, int maxDoc){
+		SortedDocValuesFacetIterator(SortedDocValues docValues, BitSet liveDocs, int maxDoc){
 			this.docValues = docValues;
+			this.liveDocs = liveDocs;
 			this.maxDoc = maxDoc;
 		}
 		@Override
@@ -483,19 +478,16 @@ public class FacetQueryBuilder {
 				int[] termsCount = new int[valueCount];
 				if(this.liveDocs == null){
 					int term = 0;
-					for(int i=0;i<this.maxDoc;i++){
-						docValues.setDocument(i);
-						while ((term = (int) docValues.nextOrd()) != SortedSetDocValues.NO_MORE_ORDS) {
+					for(int doc=0;doc<maxDoc;doc++){
+						if((term=docValues.getOrd(doc))!=-1){
 							termsCount[term]++;
 						}
 					}
 				} else {
-					SortedSetDocValues docValues = this.docValues;
 					BitSetIterator it = new BitSetIterator(this.liveDocs, 0);
 					int doc = 0, term = 0;
 					while((doc=it.nextDoc())!=BitSetIterator.NO_MORE_DOCS){
-						docValues.setDocument(doc);
-						while ((term = (int) docValues.nextOrd()) != SortedSetDocValues.NO_MORE_ORDS) {
+						if((term=docValues.getOrd(doc))!=-1){
 							termsCount[term]++;
 						}
 					}
